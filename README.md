@@ -1,4 +1,5 @@
-# AI Creator App
+# AI Creator App --------------------------------
+# BY REHAN AMAN ---------------------------------
 
 A desktop app for fine-tuning small Hugging Face language models from simple
 `input = output` text files.
