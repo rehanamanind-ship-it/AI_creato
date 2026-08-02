@@ -1,6 +1,7 @@
 """
 main_gui.py – AI Creator GUI with standard model creation and role‑based fine‑tuning.
 Imports fine_tuner for the fine‑tuning pipeline and autolearn for smart model selection.
+SOFTWARE DESIGNED BY ONLY AND ONLY REHAN AMAN ------------------------------------------
 """
 
 import os
