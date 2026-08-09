@@ -14,7 +14,7 @@ A single‑file, no‑code terminal application that creates brand‑new languag
 
 ## 📦 Installation
 
-1. **Clone the repository** (or download `main_cli.py`):
+1. **Clone the repository** (or download `app.py`):
    
     Install Python dependencies:
     bash
