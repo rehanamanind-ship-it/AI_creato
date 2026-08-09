@@ -1,16 +1,19 @@
 """
-main_cli.py – AI Creator terminal application.
-Trains new models, fine‑tunes existing ones, and exports GGUF — all from the command line.
-Uses autolearn and fine_tuner if present.
+main_cli.py – AI Creator Terminal Application.
+Trains new models, fine‑tunes with roles, exports GGUF – all in one file.
+Uses autolearn if available.
 MADE BY ONLY AND ONLY REHAN AMAN
 """
 
 import os
+import re
 import shutil
 import subprocess
+import logging
 from pathlib import Path
+from typing import Optional, List, Dict
 
-# Core ML imports – exit gracefully if missing
+# Core ML imports
 try:
     import torch
     from datasets import Dataset
@@ -18,29 +21,33 @@ try:
         AutoModelForCausalLM,
         AutoModelForMaskedLM,
         AutoTokenizer,
+        AutoConfig,
+        BitsAndBytesConfig,
         DataCollatorForLanguageModeling,
         Trainer,
         TrainingArguments,
         pipeline,
     )
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        prepare_model_for_kbit_training,
+        TaskType,
+    )
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
-    print("Warning: HuggingFace libraries not found. Only fine‑tuning will be possible.\n")
+    print("Warning: Core ML libraries not found. Training will be disabled.\n")
 
 # Optional modules
-try:
-    import fine_tuner
-    FINE_TUNER_AVAILABLE = True
-except ImportError:
-    FINE_TUNER_AVAILABLE = False
-
 try:
     from autolearn import AutoLearn
     AUTOLEARN_AVAILABLE = True
 except ImportError:
     AUTOLEARN_AVAILABLE = False
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "trained_model"
@@ -62,28 +69,324 @@ QUANT_OPTIONS = {
 }
 
 
-# Main CLI application class
+# ======================================================================
+# Fine‑tuning engine (previously in fine_tuner.py)
+# ======================================================================
+
+# Splits equals‑format text into training examples.
+def parse_equals_input(text: str) -> List[Dict[str, str]]:
+    """Parse a multi‑example string separated by '===' into role dicts."""
+    if not text or not text.strip():
+        return []
+
+    raw_blocks = re.split(r'\n?===+\n?', text.strip())
+    examples = []
+    current_system = None
+
+    for block in raw_blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        segments = re.split(r'(?=^\s*=\w+=)', block, flags=re.MULTILINE)
+        system, user, assistant = None, None, None
+
+        for seg in segments:
+            seg = seg.strip()
+            if not seg:
+                continue
+            match = re.match(r'^\s*=(\w+)=\s*(.*)', seg, re.DOTALL)
+            if not match:
+                logger.warning(f"Unrecognised segment: {seg[:50]}...")
+                continue
+            role = match.group(1).upper()
+            content = match.group(2).strip()
+
+            if role == "SYSTEM":
+                system = content
+                current_system = content
+            elif role == "USER":
+                user = content
+            elif role == "ASSISTANT":
+                assistant = content
+
+        if not system and current_system:
+            system = current_system
+
+        if user and assistant:
+            examples.append({
+                "system": system or "",
+                "user": user,
+                "assistant": assistant
+            })
+    return examples
+
+# Converts parsed examples into a HuggingFace Dataset with a "messages" column.
+def build_dataset_from_roles(parsed: List[Dict[str, str]]) -> Dataset:
+    """Wrap a list of role dicts into a Dataset with a 'messages' field."""
+    conversations = []
+    for ex in parsed:
+        messages = []
+        if ex["system"]:
+            messages.append({"role": "system", "content": ex["system"]})
+        messages.append({"role": "user", "content": ex["user"]})
+        messages.append({"role": "assistant", "content": ex["assistant"]})
+        conversations.append({"messages": messages})
+    return Dataset.from_list(conversations)
+
+# Converts a .gguf file into a HuggingFace‑compatible directory.
+def gguf_to_hf(gguf_path: str, base_model_id: str, output_dir: str) -> str:
+    """Convert a GGUF file into a HuggingFace model saved to output_dir."""
+    try:
+        import gguf
+    except ImportError as e:
+        raise ImportError("gguf package required. Install with: pip install gguf") from e
+
+    os.makedirs(output_dir, exist_ok=True)
+    config = AutoConfig.from_pretrained(base_model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+    tokenizer.save_pretrained(output_dir)
+
+    reader = gguf.GGUFReader(gguf_path)
+    tensors = {tensor.name: torch.from_numpy(tensor.data) for tensor in reader.tensors}
+
+    hf_weights = _map_gguf_to_hf(tensors, config)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    model.load_state_dict(hf_weights, strict=False, assign=True)
+    model.save_pretrained(output_dir, safe_serialization=True)
+    logger.info(f"GGUF converted to {output_dir}")
+    return output_dir
+
+# Maps GGUF tensor names to HuggingFace parameter names.
+def _map_gguf_to_hf(tensors: Dict[str, torch.Tensor], config) -> Dict[str, torch.Tensor]:
+    """Translate raw GGUF tensor names to HuggingFace layer names."""
+    hf_weights = {}
+    for gguf_name, weight in tensors.items():
+        new_name = gguf_name
+        m = re.match(r'blk\.(\d+)\.(.+)', gguf_name)
+        if m:
+            layer_idx, param = m.group(1), m.group(2)
+            mapping = {
+                "attn_q.weight": f"model.layers.{layer_idx}.self_attn.q_proj.weight",
+                "attn_k.weight": f"model.layers.{layer_idx}.self_attn.k_proj.weight",
+                "attn_v.weight": f"model.layers.{layer_idx}.self_attn.v_proj.weight",
+                "attn_output.weight": f"model.layers.{layer_idx}.self_attn.o_proj.weight",
+                "ffn_gate.weight": f"model.layers.{layer_idx}.mlp.gate_proj.weight",
+                "ffn_up.weight": f"model.layers.{layer_idx}.mlp.up_proj.weight",
+                "ffn_down.weight": f"model.layers.{layer_idx}.mlp.down_proj.weight",
+                "attn_norm.weight": f"model.layers.{layer_idx}.input_layernorm.weight",
+                "ffn_norm.weight": f"model.layers.{layer_idx}.post_attention_layernorm.weight",
+            }
+            new_name = mapping.get(param, None)
+            if new_name is None:
+                logger.warning(f"Skipping unmapped GGUF parameter: {gguf_name}")
+                continue
+        elif gguf_name == "token_embd.weight":
+            new_name = "model.embed_tokens.weight"
+        elif gguf_name == "output_norm.weight":
+            new_name = "model.norm.weight"
+        elif gguf_name == "output.weight":
+            new_name = "lm_head.weight"
+        # else: keep original name
+        hf_weights[new_name] = weight
+    return hf_weights
+
+# Converts a HuggingFace model directory to a GGUF file.
+def hf_to_gguf(hf_dir: str, output_gguf: str, quant_type: str = "q8_0") -> str:
+    """Export a HuggingFace model to a GGUF file with optional quantization."""
+    try:
+        from llama_cpp.llama_cpp import llama_convert_hf_to_gguf
+        llama_convert_hf_to_gguf(model=hf_dir, output=output_gguf, outtype=quant_type)
+        return output_gguf
+    except (ImportError, Exception):
+        script = "convert-hf-to-gguf.py"
+        cmd = [script, hf_dir, "--outtype", quant_type, "--outfile", output_gguf]
+        subprocess.run(cmd, check=True)
+        return output_gguf
+
+# Prepares tokenizer and model for QLoRA fine‑tuning.
+def _prepare_model_and_tokenizer(model_id_or_dir: str, use_4bit: bool = True, bf16: bool = True):
+    """Load tokenizer and model with optional 4‑bit quantization."""
+    tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    bnb_config = None
+    if use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16 if bf16 else torch.float16,
+        )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id_or_dir,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16 if bf16 else torch.float16,
+    )
+    return tokenizer, model
+
+# Formats a message list into a text prompt for the tokenizer.
+def _format_chat(example, tokenizer):
+    """Convert a messages list to a single string using the tokenizer's template."""
+    msgs = example["messages"]
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template:
+        return tokenizer.apply_chat_template(msgs, tokenize=False)
+    lines = [f"{m['role'].capitalize()}: {m['content']}" for m in msgs]
+    return "\n".join(lines)
+
+# Runs QLoRA fine‑tuning and returns the merged model path.
+def run_lora_finetuning(
+    base_model_dir: str,
+    dataset: Dataset,
+    output_dir: str,
+    num_epochs: int = 3,
+    batch_size: int = 4,
+    learning_rate: float = 2e-4,
+    use_4bit: bool = True,
+) -> str:
+    """Fine‑tune a causal LM with LoRA and return the merged model path."""
+    tokenizer, model = _prepare_model_and_tokenizer(base_model_dir, use_4bit)
+    if use_4bit:
+        model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules="all-linear",
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_config)
+
+    def tokenize(examples):
+        texts = [_format_chat(ex, tokenizer) for ex in examples]
+        return tokenizer(texts, truncation=True, max_length=2048, padding="max_length")
+
+    tokenized = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+
+    training_args = TrainingArguments(
+        output_dir=os.path.join(output_dir, "checkpoints"),
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=4,
+        num_train_epochs=num_epochs,
+        learning_rate=learning_rate,
+        bf16=True,
+        logging_steps=10,
+        save_steps=200,
+        optim="paged_adamw_8bit",
+        report_to="none",
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized,
+        data_collator=lambda data: {
+            "input_ids": torch.stack([d["input_ids"] for d in data]),
+            "attention_mask": torch.stack([d["attention_mask"] for d in data]),
+            "labels": torch.stack([d["input_ids"] for d in data]),
+        },
+    )
+    trainer.train()
+
+    model.save_pretrained(os.path.join(output_dir, "adapter"))
+    tokenizer.save_pretrained(os.path.join(output_dir, "adapter"))
+    merged = model.merge_and_unload()
+    merged_path = os.path.join(output_dir, "merged_model")
+    merged.save_pretrained(merged_path, safe_serialization=True)
+    tokenizer.save_pretrained(merged_path)
+    return merged_path
+
+# Applies 4‑bit quantization to a HuggingFace model.
+def apply_quantization(model_path: str, output_dir: str, method: str = "autoawq") -> str:
+    """Apply 4‑bit quantization to a model directory."""
+    if method == "autoawq":
+        try:
+            from awq import AutoAWQForCausalLM
+            model = AutoAWQForCausalLM.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model.quantize(tokenizer, quant_config={"zero_point": True, "q_group_size": 128})
+            model.save_quantized(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            return output_dir
+        except ImportError:
+            logger.warning("AutoAWQ not found, falling back to bitsandbytes (disk size unchanged).")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, quantization_config=bnb_config, device_map="auto", trust_remote_code=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model.save_pretrained(output_dir, safe_serialization=True)
+    tokenizer.save_pretrained(output_dir)
+    return output_dir
+
+# End‑to‑end fine‑tuning pipeline.
+def run_finetuning_pipeline(
+    training_text: str,
+    base_model_id: str,
+    output_dir: str = "./fine_tuned",
+    quantize: bool = False,
+    export_gguf: bool = False,
+    gguf_quant_type: str = "q8_0",
+    uploaded_gguf_path: Optional[str] = None,
+) -> str:
+    """Full fine‑tuning pipeline from equals‑format text to final model."""
+    parsed = parse_equals_input(training_text)
+    if not parsed:
+        raise ValueError("No valid training examples found in the input.")
+    dataset = build_dataset_from_roles(parsed)
+
+    # Determine base model directory (HF or converted GGUF)
+    if uploaded_gguf_path:
+        gguf_hf_dir = os.path.join(output_dir, "gguf_converted")
+        base_model_dir = gguf_to_hf(uploaded_gguf_path, base_model_id, gguf_hf_dir)
+    else:
+        base_model_dir = base_model_id
+
+    merged = run_lora_finetuning(base_model_dir, dataset, output_dir)
+    if quantize:
+        merged = apply_quantization(merged, os.path.join(output_dir, "quantized"))
+    if export_gguf:
+        merged = hf_to_gguf(merged, os.path.join(output_dir, "fine_tuned.gguf"), gguf_quant_type)
+    return merged
+
+
+# ======================================================================
+# Main CLI Application
+# ======================================================================
+
+# Main application class.
 class AICreatorCLI:
     """Terminal interface for AI creation and fine‑tuning."""
-# Initialise the application state and start the main loop.
+# Initialise the app state and start the main loop.
     def __init__(self):
         self.model = None
         self.tokenizer = None
         self.generator = None
         self.fill_mask = None
-        self.trained_model_dir = None       # path to latest trained HF model
-        self.fine_tuned_path = None         # path to fine‑tuned model (HF or GGUF)
-        self.active_model_task = None       # "causal" or "masked"
+        self.trained_model_dir = None
+        self.fine_tuned_path = None
+        self.active_model_task = None
         self.main_menu()
-# Main interactive loop – prints menu and handles user choice.
+
+# Main interactive loop.
     def main_menu(self):
         while True:
             print("\n" + "=" * 40)
             print("AI CREATOR – Terminal Edition")
             print("=" * 40)
             print("1. Train new model (input = output text file)")
-            if FINE_TUNER_AVAILABLE:
-                print("2. Fine‑tune with roles (equals‑format)")
+            print("2. Fine‑tune with roles (equals‑format)")
             print("3. Export trained model to GGUF")
             print("4. Test prediction")
             print("5. Quit")
@@ -91,7 +394,7 @@ class AICreatorCLI:
 
             if choice == "1":
                 self.train_new_model()
-            elif choice == "2" and FINE_TUNER_AVAILABLE:
+            elif choice == "2":
                 self.fine_tune_with_roles()
             elif choice == "3":
                 self.export_gguf()
@@ -104,7 +407,7 @@ class AICreatorCLI:
                 print("Invalid option. Please try again.")
 
 # ---------- 1. Standard training ----------
-# Handles the entire workflow: file selection, model type, training.
+# Handles the complete training workflow from file to model.
     def train_new_model(self):
         if not ML_AVAILABLE:
             print("ERROR: Required ML libraries (transformers, datasets) not installed.")
@@ -128,7 +431,6 @@ class AICreatorCLI:
             print("Invalid choice, using Auto Learn.")
             model_choice = "1"
 
-        # Resolve preset (using AutoLearn if possible)
         if model_choice == "1":
             preset = self._resolve_preset(data)
         else:
@@ -141,7 +443,8 @@ class AICreatorCLI:
             print("Training completed successfully!")
         except Exception as e:
             print(f"Training failed: {e}")
-# Parses the input=output file into a list of dicts.
+
+# Parses a text file into input‑output pairs.
     def _parse_file(self, file_path):
         data = []
         with open(file_path, "r", encoding="utf-8") as f:
@@ -154,7 +457,8 @@ class AICreatorCLI:
                 if inp and out:
                     data.append({"input": inp, "output": out})
         return data
-# Uses AutoLearn (or fallback heuristic) to pick a model.
+
+# Resolves the model preset (using AutoLearn if available).
     def _resolve_preset(self, data):
         if AUTOLEARN_AVAILABLE:
             try:
@@ -165,9 +469,9 @@ class AICreatorCLI:
                         return pres
             except Exception:
                 pass
-        # Fallback
         return PRESETS["4"] if len(data) < 100 else PRESETS["2"]
-# Loads the base model, tokenises, and trains on the dataset.
+
+# Performs the actual training and saves the model.
     def _train_model(self, preset, data):
         task = preset["task"]
         model_id = preset["model"]
@@ -225,10 +529,10 @@ class AICreatorCLI:
             self.fill_mask = None
 
 # ---------- 2. Fine‑tuning ----------
-# Runs the fine‑tuning pipeline using fine_tuner module.
+# Runs the fine‑tuning pipeline.
     def fine_tune_with_roles(self):
-        if not FINE_TUNER_AVAILABLE:
-            print("fine_tuner module not found. Cannot fine‑tune.")
+        if not ML_AVAILABLE:
+            print("ERROR: Required ML libraries not installed.")
             return
 
         print("\nPaste your training examples (SYSTEM/USER/ASSISTANT, separated by '===').")
@@ -253,7 +557,6 @@ class AICreatorCLI:
             print("Invalid, using LLM.")
             base_model = "distilgpt2"
 
-        # Optional GGUF upload
         use_gguf = input("Use a local .gguf file as base? (y/n): ").strip().lower() == "y"
         gguf_path = None
         arch_id = base_model
@@ -271,9 +574,9 @@ class AICreatorCLI:
         quantize = input("Apply 4‑bit quantization after training? (y/n): ").strip().lower() == "y"
         export_gguf = input("Export as GGUF after training? (y/n): ").strip().lower() == "y"
 
-        print("Starting fine‑tuning... (this may take many minutes)")
+        print("Starting fine‑tuning...")
         try:
-            result = fine_tuner.run_finetuning_pipeline(
+            result = run_finetuning_pipeline(
                 training_text=text,
                 base_model_id=arch_id if gguf_path else base_model,
                 output_dir=str(FINE_TUNED_DIR),
@@ -285,7 +588,8 @@ class AICreatorCLI:
             print(f"Fine‑tuning completed! Model saved to: {result}")
         except Exception as e:
             print(f"Fine‑tuning failed: {e}")
-# Reads multi‑line input (either paste or from file).
+
+# Reads multi‑line input (paste or from file).
     def _read_multiline_input(self):
         first_line = input().strip()
         if os.path.isfile(first_line):
@@ -298,7 +602,8 @@ class AICreatorCLI:
                 break
             lines.append(line)
         return "\n".join(lines)
-# Auto‑selects a base model for fine‑tuning (simple heuristic).
+
+# Auto‑selects a base model for fine‑tuning.
     def _auto_select_fine_tune_model(self):
         if AUTOLEARN_AVAILABLE:
             try:
@@ -311,9 +616,8 @@ class AICreatorCLI:
         return "distilgpt2"
 
 # ---------- 3. GGUF Export ----------
-# Exports the most recent trained model (standard or fine‑tuned) as a GGUF file.
+# Exports the most recently trained model to a GGUF file.
     def export_gguf(self):
-        # Determine source directory
         src = None
         if self.trained_model_dir and self.trained_model_dir.exists():
             src = self.trained_model_dir
@@ -330,7 +634,7 @@ class AICreatorCLI:
         if q_choice not in QUANT_OPTIONS:
             print("Invalid, using 16q.")
             q_choice = "3"
-        quant_label, quant_type = QUANT_OPTIONS[q_choice]
+        _, quant_type = QUANT_OPTIONS[q_choice]
 
         out_path = input("Enter output file path (e.g. my_model.gguf): ").strip()
         if not out_path:
@@ -342,11 +646,12 @@ class AICreatorCLI:
             print(f"GGUF file saved to: {out_path}")
         except Exception as e:
             print(f"Export failed: {e}")
-# Converts HF model to GGUF using llama.cpp tools.
+
+# Converts an HF model to a GGUF file using llama.cpp.
     def _convert_to_gguf(self, model_dir, output_path, quant_type):
         converter = self._find_llama_cpp_file("convert_hf_to_gguf.py")
         if not converter:
-            raise RuntimeError("llama.cpp not found. Set LLAMA_CPP_DIR to the llama.cpp folder.")
+            raise RuntimeError("llama.cpp not found. Set LLAMA_CPP_DIR environment variable.")
         GGUF_DIR.mkdir(exist_ok=True)
         f16 = GGUF_DIR / "tmp_f16.gguf"
         subprocess.run(["python", str(converter), str(model_dir), "--outfile", str(f16)], check=True)
@@ -355,8 +660,9 @@ class AICreatorCLI:
             return
         quantizer = self._find_llama_cpp_file("llama-quantize") or self._find_llama_cpp_file("quantize")
         if not quantizer:
-            raise RuntimeError("llama-quantize executable not found. Build llama.cpp or set LLAMA_CPP_DIR.")
+            raise RuntimeError("llama-quantize executable not found.")
         subprocess.run([str(quantizer), str(f16), str(output_path), quant_type], check=True)
+
 # Searches for a file inside the llama.cpp folder.
     def _find_llama_cpp_file(self, name):
         search_dirs = [APP_DIR / "llama.cpp", Path(os.environ.get("LLAMA_CPP_DIR", ""))]
@@ -369,7 +675,7 @@ class AICreatorCLI:
         return None
 
 # ---------- 4. Test prediction ----------
-# Runs a prediction using the currently loaded standard model.
+# Runs predictions on the standard trained model.
     def test_prediction(self):
         if self.model is None or self.tokenizer is None:
             print("No standard model available. Train a model first (option 1).")
@@ -399,6 +705,5 @@ class AICreatorCLI:
                 print(f"Prediction error: {e}")
 
 
-# Application entry point
 if __name__ == "__main__":
     AICreatorCLI()
