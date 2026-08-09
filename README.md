@@ -15,9 +15,9 @@ A single‑file, no‑code terminal application that creates brand‑new languag
 ## 📦 Installation
 
 1. **Clone the repository** (or download `main_cli.py`):
-   ```bash
-   git clone https://github.com/yourusername/ai-creator.git
-   cd ai-creator
+   
+   git clone https://github.com/CODER>>REHAN AMAN/AI_creato.git
+   cd AI_creato
 
     Install Python dependencies:
     bash
@@ -127,12 +127,13 @@ AI CREATOR – Terminal Edition
 📁 File Structure
 text
 
-ai-creator/
-├── main_cli.py         # The complete application (training + fine‑tuning + export)
-├── requirements.txt    # (optional) list of dependencies
+ai-creato/
+├── app.py         # The complete application (training + fine‑tuning + export)
+├── requirements.txt # (optional) list of dependencies
+|---- autolearn.py
 └── README.md
 
-(No separate fine_tuner.py is needed – everything is integrated in main_cli.py.)
+(No separate fine_tuner.py is needed – everything is integrated in app.py.)
 🧠 How It Works
 
     Standard training uses HuggingFace Trainer to fine‑tune a small base model (like DistilGPT2) on your input‑output pairs.
