@@ -3,7 +3,6 @@
 main_cli.py – AI Creator Curses Terminal Application.
 Fully interactive TUI for training, fine‑tuning, and GGUF export.
 Uses autolearn if available.
-MADE BY ONLY AND ONLY REHAN AMAN
 """
 
 import os
@@ -69,6 +68,15 @@ QUANT_OPTIONS = {
     "4": ("36q", "q6_k"),
 }
 
+MIN_WIDTH = 80
+MIN_HEIGHT = 24
+
+
+# Helper to ensure Dataset is available.
+def _require_dataset():
+    if Dataset is None:
+        raise ImportError("The 'datasets' library is required. Install with: pip install datasets")
+
 
 # ======================================================================
 # Fine‑tuning engine (integrated, no external imports needed)
@@ -112,11 +120,10 @@ def parse_equals_input(text: str) -> List[Dict[str, str]]:
             examples.append({"system": system or "", "user": user, "assistant": assistant})
     return examples
 
-# Converts parsed examples into a Dataset – checks for Dataset availability.
+# Converts parsed examples into a Dataset.
 def build_dataset_from_roles(parsed: List[Dict[str, str]]):
     """Wrap role dicts into a Dataset with a 'messages' field."""
-    if Dataset is None:
-        raise ImportError("datasets library is required for fine‑tuning. Install with: pip install datasets")
+    _require_dataset()
     conversations = []
     for ex in parsed:
         messages = []
@@ -329,7 +336,17 @@ class AICreatorTUI:
         self.active_task = None
         self.status_message = "Ready. Use arrow keys to navigate, Enter to select."
         self._init_colors()
+        self._check_terminal_size()
         self._main_loop()
+
+# Checks if terminal meets minimum size requirements.
+    def _check_terminal_size(self):
+        h, w = self.stdscr.getmaxyx()
+        if w < MIN_WIDTH or h < MIN_HEIGHT:
+            self.stdscr.addstr(0, 0, f"Terminal too small. Need at least {MIN_WIDTH}x{MIN_HEIGHT}.")
+            self.stdscr.refresh()
+            self.stdscr.getch()
+            raise SystemExit("Terminal too small.")
 
 # Setup curses colour pairs.
     def _init_colors(self):
@@ -398,21 +415,75 @@ class AICreatorTUI:
             self._cleanup()
             exit(0)
 
-# Pops out of curses to get user input, then restores.
-    def _temp_input(self, prompt):
-        curses.endwin()
+# Opens a centered pop‑up window to safely get user input inside curses.
+    def _input_popup(self, title, default=""):
+        """Display a pop‑up dialog to collect a single string from the user."""
+        h, w = self.stdscr.getmaxyx()
+        pw, ph = 60, 3
+        y = (h - ph) // 2
+        x = (w - pw) // 2
+        popup = curses.newwin(ph, pw, y, x)
+        popup.bkgd(' ', curses.color_pair(1))
+        popup.box()
+        popup.addstr(0, 2, title)
+        curses.echo()
+        curses.curs_set(1)
+        result = ""
         try:
-            return input(prompt)
+            popup.move(1, 2)
+            result = popup.getstr(1, 2, pw-4).decode("utf-8").strip()
+        except Exception:
+            pass
         finally:
-            curses.doupdate()
+            curses.noecho()
+            curses.curs_set(0)
+            del popup
+            self.stdscr.touchwin()
+            self.stdscr.refresh()
+        return result if result else default
+
+# Opens a larger pop‑up window for multi‑line input (fine‑tuning examples).
+    def _multiline_popup(self, title):
+        """Display a pop‑up that captures multiple lines until END is entered."""
+        h, w = self.stdscr.getmaxyx()
+        pw, ph = 70, 15
+        y = (h - ph) // 2
+        x = (w - pw) // 2
+        popup = curses.newwin(ph, pw, y, x)
+        popup.bkgd(' ', curses.color_pair(1))
+        popup.box()
+        popup.addstr(0, 2, title)
+        popup.addstr(ph-2, 2, "Press Enter on empty line to finish.")
+        curses.echo()
+        curses.curs_set(1)
+        lines = []
+        current_line = 1
+        try:
+            while True:
+                popup.move(current_line, 2)
+                line = popup.getstr(current_line, 2, pw-4).decode("utf-8").strip()
+                if not line:
+                    break
+                lines.append(line)
+                current_line += 1
+                if current_line >= ph-2:  # stop when reaching bottom
+                    break
+        except Exception:
+            pass
+        finally:
+            curses.noecho()
+            curses.curs_set(0)
+            del popup
+            self.stdscr.touchwin()
+            self.stdscr.refresh()
+        return "\n".join(lines)
 
 # ---------- Training ----------
     def _train_new_model(self):
         if not ML_AVAILABLE:
             self._show_message("ML libraries not installed. Cannot train.", error=True)
             return
-        self._show_message("Training mode – press any key to continue...", wait=True)
-        file_path = self._temp_input("Enter training file path (input = output per line): ")
+        file_path = self._input_popup("Training file path (input = output per line): ")
         if not file_path or not os.path.isfile(file_path):
             self._show_message("File not found.", error=True)
             return
@@ -420,9 +491,8 @@ class AICreatorTUI:
         if not data:
             self._show_message("No valid training pairs found.", error=True)
             return
-        self._show_message(f"Loaded {len(data)} examples.")
-        self._show_message("Choose model type (1-Auto,2-LLM,3-MLM,4-SLM): ", wait=False)
-        choice = self._temp_input("Your choice (default 1): ") or "1"
+        self._show_message(f"Loaded {len(data)} examples. Choose model type.")
+        choice = self._input_popup("1-Auto 2-LLM 3-MLM 4-SLM (default 1): ", "1")
         if choice not in PRESETS:
             choice = "1"
         if choice == "1":
@@ -461,6 +531,7 @@ class AICreatorTUI:
         return PRESETS["4"] if len(data) < 100 else PRESETS["2"]
 
     def _train_model(self, preset, data):
+        _require_dataset()
         task = preset["task"]
         model_id = preset["model"]
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -504,33 +575,30 @@ class AICreatorTUI:
         if not ML_AVAILABLE:
             self._show_message("ML libraries not installed.", error=True)
             return
-        self._show_message("Fine‑tuning mode – you will enter examples in the terminal.", wait=True)
-        self._show_message("Paste your equals‑format examples, end with a line containing 'END'.")
-        curses.endwin()
-        text = self._read_multiline_input()
-        curses.doupdate()
+        self._show_message("Fine‑tuning mode – paste your examples next.")
+        text = self._multiline_popup("Paste equals‑format examples (end with empty line)")
         if not text:
             self._show_message("No input received.", error=True)
             return
         self._show_message(f"Got {len(parse_equals_input(text))} examples.")
-        base_choice = self._temp_input("Base model: 1-Auto, 2-LLM, 3-SLM (default 1): ") or "1"
+        base_choice = self._input_popup("Base model: 1-Auto, 2-LLM, 3-SLM (default 1): ", "1")
         if base_choice == "1": base_model = self._auto_select_fine_tune_model()
         elif base_choice == "2": base_model = "distilgpt2"
         else: base_model = "sshleifer/tiny-gpt2"
-        use_gguf = self._temp_input("Use a local .gguf file as base? (y/n): ").lower() == "y"
+        use_gguf = self._input_popup("Use a local .gguf file as base? (y/n): ", "n").lower() == "y"
         gguf_path = None; arch_id = base_model
         if use_gguf:
-            gguf_path = self._temp_input("Path to .gguf file: ")
+            gguf_path = self._input_popup("Path to .gguf file: ")
             if not os.path.isfile(gguf_path):
                 self._show_message("File not found. Using default base.")
                 gguf_path = None
             else:
-                arch_id = self._temp_input("HuggingFace architecture ID (e.g. meta-llama/Llama-2-7b-hf): ")
+                arch_id = self._input_popup("HuggingFace architecture ID (e.g. meta-llama/Llama-2-7b-hf): ")
                 if not arch_id:
                     self._show_message("Architecture ID required. Using default.")
                     gguf_path = None
-        quantize = self._temp_input("Apply 4‑bit quantization after training? (y/n): ").lower() == "y"
-        export_gguf = self._temp_input("Export as GGUF after training? (y/n): ").lower() == "y"
+        quantize = self._input_popup("Apply 4‑bit quantization after training? (y/n): ", "n").lower() == "y"
+        export_gguf = self._input_popup("Export as GGUF after training? (y/n): ", "n").lower() == "y"
         self._show_message("Fine‑tuning started... (check console for logs)")
         try:
             result = run_finetuning_pipeline(
@@ -545,15 +613,6 @@ class AICreatorTUI:
             self._show_message(f"Fine‑tuning complete! Model at {result}")
         except Exception as e:
             self._show_message(f"Fine‑tuning failed: {e}", error=True)
-
-    def _read_multiline_input(self):
-        lines = []
-        while True:
-            line = input()
-            if line.strip() == "END":
-                break
-            lines.append(line)
-        return "\n".join(lines)
 
     def _auto_select_fine_tune_model(self):
         if AUTOLEARN_AVAILABLE:
@@ -576,12 +635,11 @@ class AICreatorTUI:
         if not src:
             self._show_message("No trained model to export.", error=True)
             return
-        self._show_message("Quantization: 1-4q,2-8q,3-16q,4-36q")
-        choice = self._temp_input("Choose (default 3): ") or "3"
+        choice = self._input_popup("Quantization: 1-4q, 2-8q, 3-16q, 4-36q (default 3): ", "3")
         if choice not in QUANT_OPTIONS:
             choice = "3"
         _, quant_type = QUANT_OPTIONS[choice]
-        out_path = self._temp_input("Output file path (e.g. my_model.gguf): ")
+        out_path = self._input_popup("Output file path (e.g. my_model.gguf): ")
         if not out_path:
             return
         try:
@@ -619,23 +677,30 @@ class AICreatorTUI:
         if self.model is None or self.tokenizer is None:
             self._show_message("No standard model trained yet.", error=True)
             return
-        self._show_message("Testing model – switch to terminal.", wait=False)
-        curses.endwin()
-        try:
-            while True:
-                prompt = input("Enter prompt (or 'exit'): ")
-                if prompt.lower() == "exit":
-                    break
+        self._show_message("Testing model – you can now enter prompts.")
+        curses.curs_set(1)
+        curses.echo()
+        self.stdscr.move(6, 2)
+        self.stdscr.addstr(6, 2, "Enter prompt (or 'exit'): ")
+        self.stdscr.refresh()
+        while True:
+            prompt = self._input_popup("Enter prompt (or 'exit'): ")
+            if not prompt or prompt.lower() == "exit":
+                break
+            try:
                 if self.fill_mask:
                     out = self.fill_mask(f"{prompt} {self.tokenizer.mask_token}", top_k=1)[0]["sequence"]
-                    print(f"Result: {out}")
+                    self._show_message(f"Result: {out}")
                 else:
                     gen = self.generator(f"Input: {prompt}\nOutput:", max_new_tokens=60, do_sample=True,
                                          temperature=0.7, pad_token_id=self.tokenizer.pad_token_id)[0]["generated_text"]
-                    print(f"Output: {gen.split('Output:',1)[-1].strip()}")
-        finally:
-            curses.doupdate()
-            self._show_message("Prediction session ended.")
+                    output = gen.split("Output:", 1)[-1].strip()
+                    self._show_message(f"Output: {output}")
+            except Exception as e:
+                self._show_message(f"Prediction error: {e}", error=True)
+        curses.noecho()
+        curses.curs_set(0)
+        self._show_message("Prediction session ended.")
 
 # ---------- Status display helpers ----------
     def _show_message(self, msg, wait=False, error=False):
