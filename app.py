@@ -3,7 +3,6 @@
 main_cli.py – AI Creator Curses Terminal Application.
 Fully interactive TUI for training, fine‑tuning, and GGUF export.
 Uses autolearn if available.
-MADE BY REHAN AMAN
 """
 
 import os
@@ -38,6 +37,7 @@ try:
     )
     ML_AVAILABLE = True
 except ImportError:
+    Dataset = None
     ML_AVAILABLE = False
 
 try:
@@ -111,9 +111,11 @@ def parse_equals_input(text: str) -> List[Dict[str, str]]:
             examples.append({"system": system or "", "user": user, "assistant": assistant})
     return examples
 
-# Converts parsed examples into a Dataset.
-def build_dataset_from_roles(parsed: List[Dict[str, str]]) -> Dataset:
+# Converts parsed examples into a Dataset – checks for Dataset availability.
+def build_dataset_from_roles(parsed: List[Dict[str, str]]):
     """Wrap role dicts into a Dataset with a 'messages' field."""
+    if Dataset is None:
+        raise ImportError("datasets library is required for fine‑tuning. Install with: pip install datasets")
     conversations = []
     for ex in parsed:
         messages = []
