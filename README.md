@@ -16,9 +16,6 @@ A single‑file, no‑code terminal application that creates brand‑new languag
 
 1. **Clone the repository** (or download `main_cli.py`):
    
-   git clone https://github.com/CODER>>REHAN_AMAN/AI_creato.git
-   cd AI_creato
-
     Install Python dependencies:
     bash
 
