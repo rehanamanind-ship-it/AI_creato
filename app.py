@@ -3,6 +3,7 @@
 main_cli.py – AI Creator Curses Terminal Application.
 Fully interactive TUI for training, fine‑tuning, and GGUF export.
 Uses autolearn if available.
+MADE BY ONLY AND ONLY REHAN AMAN
 """
 
 import os
