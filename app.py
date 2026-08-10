@@ -335,6 +335,7 @@ class AICreatorTUI:
         self.fine_tuned_path = None
         self.active_task = None
         self.status_message = "Ready. Use arrow keys to navigate, Enter to select."
+        self.running = True
         self._init_colors()
         self._check_terminal_size()
         self._main_loop()
@@ -366,7 +367,7 @@ class AICreatorTUI:
             "Test prediction",
             "Quit",
         ]
-        while True:
+        while self.running:
             self._draw_screen(menu_items, current_row)
             key = self.stdscr.getch()
             if key == curses.KEY_UP and current_row > 0:
@@ -376,8 +377,7 @@ class AICreatorTUI:
             elif key in (curses.KEY_ENTER, 10, 13):
                 self._handle_selection(current_row)
             elif key == ord('q'):
-                break
-        self._cleanup()
+                self.running = False
 
 # Draws the entire screen.
     def _draw_screen(self, items, selected):
@@ -401,7 +401,7 @@ class AICreatorTUI:
         self.stdscr.addstr(h-2, 0, status, curses.color_pair(4))
         self.stdscr.refresh()
 
-# Handles menu selection.
+# Handles menu selection – Quit sets running flag instead of exit().
     def _handle_selection(self, row):
         if row == 0:
             self._train_new_model()
@@ -412,8 +412,7 @@ class AICreatorTUI:
         elif row == 3:
             self._test_prediction()
         elif row == 4:
-            self._cleanup()
-            exit(0)
+            self.running = False
 
 # Opens a centered pop‑up window to safely get user input inside curses.
     def _input_popup(self, title, default=""):
@@ -444,7 +443,7 @@ class AICreatorTUI:
 
 # Opens a larger pop‑up window for multi‑line input (fine‑tuning examples).
     def _multiline_popup(self, title):
-        """Display a pop‑up that captures multiple lines until END is entered."""
+        """Display a pop‑up that captures multiple lines until empty line is entered."""
         h, w = self.stdscr.getmaxyx()
         pw, ph = 70, 15
         y = (h - ph) // 2
@@ -466,7 +465,7 @@ class AICreatorTUI:
                     break
                 lines.append(line)
                 current_line += 1
-                if current_line >= ph-2:  # stop when reaching bottom
+                if current_line >= ph-2:
                     break
         except Exception:
             pass
@@ -678,11 +677,6 @@ class AICreatorTUI:
             self._show_message("No standard model trained yet.", error=True)
             return
         self._show_message("Testing model – you can now enter prompts.")
-        curses.curs_set(1)
-        curses.echo()
-        self.stdscr.move(6, 2)
-        self.stdscr.addstr(6, 2, "Enter prompt (or 'exit'): ")
-        self.stdscr.refresh()
         while True:
             prompt = self._input_popup("Enter prompt (or 'exit'): ")
             if not prompt or prompt.lower() == "exit":
@@ -698,8 +692,6 @@ class AICreatorTUI:
                     self._show_message(f"Output: {output}")
             except Exception as e:
                 self._show_message(f"Prediction error: {e}", error=True)
-        curses.noecho()
-        curses.curs_set(0)
         self._show_message("Prediction session ended.")
 
 # ---------- Status display helpers ----------
@@ -711,10 +703,8 @@ class AICreatorTUI:
         elif error:
             curses.beep()
 
-    def _cleanup(self):
-        curses.endwin()
-        print("Goodbye!")
 
 # Application entry point
 if __name__ == "__main__":
     curses.wrapper(AICreatorTUI)
+    print("Goodbye!")
