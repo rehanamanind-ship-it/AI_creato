@@ -17,5 +17,6 @@ class AutoLearn:
             return 0
         total_words = 0
         for row in training_rows:
-            total_words += len(row["output"].split())
+            output = row.get("output", row.get("assistant", ""))
+            total_words += len(output.split())
         return total_words / len(training_rows)
