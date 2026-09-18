@@ -9,8 +9,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import curses
 import logging
+import importlib.util
 from pathlib import Path
 from typing import Optional, List, Dict
 
@@ -29,16 +31,24 @@ try:
         TrainingArguments,
         pipeline,
     )
+    ML_AVAILABLE = True
+except ImportError:
+    Dataset = None
+    ML_AVAILABLE = False
+
+try:
     from peft import (
         LoraConfig,
         get_peft_model,
         prepare_model_for_kbit_training,
         TaskType,
     )
-    ML_AVAILABLE = True
 except ImportError:
-    Dataset = None
-    ML_AVAILABLE = False
+    PEFT_AVAILABLE = False
+else:
+    PEFT_AVAILABLE = True
+
+BITSANDBYTES_AVAILABLE = importlib.util.find_spec("bitsandbytes") is not None
 
 try:
     from autolearn import AutoLearn
@@ -76,6 +86,12 @@ MIN_HEIGHT = 24
 def _require_dataset():
     if Dataset is None:
         raise ImportError("The 'datasets' library is required. Install with: pip install datasets")
+
+
+def _require_finetuning_dependencies():
+    _require_dataset()
+    if not PEFT_AVAILABLE:
+        raise ImportError("Fine-tuning requires 'peft'. Install with: pip install peft")
 
 
 # ======================================================================
@@ -187,23 +203,48 @@ def _map_gguf_to_hf(tensors, config):
         hf_weights[new_name] = weight
     return hf_weights
 
+def _find_llama_cpp_file(name: str):
+    """Find a llama.cpp tool in the bundled checkout or LLAMA_CPP_DIR."""
+    search_dirs = [APP_DIR / "llama.cpp"]
+    configured_dir = os.environ.get("LLAMA_CPP_DIR")
+    if configured_dir:
+        search_dirs.append(Path(configured_dir))
+
+    for root in search_dirs:
+        if root.exists():
+            hits = list(root.rglob(name))
+            if hits:
+                return hits[0]
+    return None
+
+
 # Converts HF model to GGUF file.
 def hf_to_gguf(hf_dir: str, output_gguf: str, quant_type: str = "q8_0") -> str:
     """Export HF model to GGUF with optional quantization."""
-    try:
-        from llama_cpp.llama_cpp import llama_convert_hf_to_gguf
-        llama_convert_hf_to_gguf(model=hf_dir, output=output_gguf, outtype=quant_type)
-        return output_gguf
-    except (ImportError, Exception):
-        script = "convert-hf-to-gguf.py"
-        subprocess.run([script, hf_dir, "--outtype", quant_type, "--outfile", output_gguf], check=True)
-        return output_gguf
+    converter = _find_llama_cpp_file("convert_hf_to_gguf.py")
+    if not converter:
+        raise RuntimeError("llama.cpp converter not found. Set LLAMA_CPP_DIR to its checkout.")
+    output_path = Path(output_gguf)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [sys.executable, str(converter), hf_dir, "--outtype", quant_type, "--outfile", str(output_path)],
+        check=True,
+    )
+    return str(output_path)
 
 # Prepares tokenizer and model for QLoRA.
 def _prepare_model_and_tokenizer(model_id_or_dir: str, use_4bit=True, bf16=True):
     """Load tokenizer and 4‑bit quantized model."""
     tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+    cuda_available = torch.cuda.is_available()
+    if use_4bit and not (cuda_available and BITSANDBYTES_AVAILABLE):
+        raise RuntimeError("4-bit loading requires a CUDA GPU and the 'bitsandbytes' package.")
     bnb_config = None
     if use_4bit:
         bnb_config = BitsAndBytesConfig(
@@ -212,13 +253,16 @@ def _prepare_model_and_tokenizer(model_id_or_dir: str, use_4bit=True, bf16=True)
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16 if bf16 else torch.float16,
         )
+    torch_dtype = torch.bfloat16 if bf16 else (torch.float16 if cuda_available else torch.float32)
     model = AutoModelForCausalLM.from_pretrained(
         model_id_or_dir,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map="auto" if cuda_available else None,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if bf16 else torch.float16,
+        torch_dtype=torch_dtype,
     )
+    if model.get_input_embeddings().num_embeddings != len(tokenizer):
+        model.resize_token_embeddings(len(tokenizer))
     return tokenizer, model
 
 # Formats chat message list into a single string.
@@ -232,7 +276,15 @@ def _format_chat(example, tokenizer):
 # Runs LoRA fine‑tuning and returns merged model path.
 def run_lora_finetuning(base_model_dir, dataset, output_dir, epochs=3, batch_size=4, lr=2e-4, use_4bit=True):
     """Fine‑tune with QLoRA and return merged model directory."""
-    tokenizer, model = _prepare_model_and_tokenizer(base_model_dir, use_4bit)
+    _require_finetuning_dependencies()
+    cuda_available = torch.cuda.is_available()
+    use_4bit = use_4bit and cuda_available and BITSANDBYTES_AVAILABLE
+    supports_bf16 = getattr(torch.cuda, "is_bf16_supported", lambda: False)
+    use_bf16 = cuda_available and supports_bf16()
+    use_fp16 = cuda_available and not use_bf16
+    os.makedirs(output_dir, exist_ok=True)
+
+    tokenizer, model = _prepare_model_and_tokenizer(base_model_dir, use_4bit, use_bf16)
     if use_4bit:
         model = prepare_model_for_kbit_training(model)
     lora_config = LoraConfig(
@@ -241,9 +293,9 @@ def run_lora_finetuning(base_model_dir, dataset, output_dir, epochs=3, batch_siz
     )
     model = get_peft_model(model, lora_config)
 
-    def tokenize(examples):
-        texts = [_format_chat(ex, tokenizer) for ex in examples]
-        return tokenizer(texts, truncation=True, max_length=2048, padding="max_length")
+    def tokenize(batch):
+        texts = [_format_chat({"messages": messages}, tokenizer) for messages in batch["messages"]]
+        return tokenizer(texts, truncation=True, max_length=2048)
 
     tokenized = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
     training_args = TrainingArguments(
@@ -252,17 +304,16 @@ def run_lora_finetuning(base_model_dir, dataset, output_dir, epochs=3, batch_siz
         gradient_accumulation_steps=4,
         num_train_epochs=epochs,
         learning_rate=lr,
-        bf16=True,
+        bf16=use_bf16,
+        fp16=use_fp16,
         logging_steps=10,
         save_steps=200,
-        optim="paged_adamw_8bit",
+        optim="paged_adamw_8bit" if use_4bit else "adamw_torch",
         report_to="none",
     )
     trainer = Trainer(
         model=model, args=training_args, train_dataset=tokenized,
-        data_collator=lambda data: {"input_ids": torch.stack([d["input_ids"] for d in data]),
-                                    "attention_mask": torch.stack([d["attention_mask"] for d in data]),
-                                    "labels": torch.stack([d["input_ids"] for d in data])},
+        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
     )
     trainer.train()
     model.save_pretrained(os.path.join(output_dir, "adapter"))
@@ -287,6 +338,8 @@ def apply_quantization(model_path: str, output_dir: str, method="autoawq") -> st
             return output_dir
         except ImportError:
             pass
+    if not (torch.cuda.is_available() and BITSANDBYTES_AVAILABLE):
+        raise RuntimeError("4-bit quantization requires a CUDA GPU and the 'bitsandbytes' package.")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
@@ -302,6 +355,7 @@ def apply_quantization(model_path: str, output_dir: str, method="autoawq") -> st
 # End‑to‑end fine‑tuning pipeline.
 def run_finetuning_pipeline(training_text, base_model_id, output_dir="./fine_tuned", quantize=False, export_gguf=False, gguf_quant_type="q8_0", uploaded_gguf_path=None):
     """Full fine‑tuning pipeline from equals‑format text."""
+    _require_finetuning_dependencies()
     parsed = parse_equals_input(training_text)
     if not parsed:
         raise ValueError("No valid training examples found.")
@@ -418,13 +472,13 @@ class AICreatorTUI:
     def _input_popup(self, title, default=""):
         """Display a pop‑up dialog to collect a single string from the user."""
         h, w = self.stdscr.getmaxyx()
-        pw, ph = 60, 3
+        pw, ph = min(max(60, len(title) + 4), w - 2), 3
         y = (h - ph) // 2
         x = (w - pw) // 2
         popup = curses.newwin(ph, pw, y, x)
         popup.bkgd(' ', curses.color_pair(1))
         popup.box()
-        popup.addstr(0, 2, title)
+        popup.addnstr(0, 2, title, pw - 4)
         curses.echo()
         curses.curs_set(1)
         result = ""
@@ -451,7 +505,7 @@ class AICreatorTUI:
         popup = curses.newwin(ph, pw, y, x)
         popup.bkgd(' ', curses.color_pair(1))
         popup.box()
-        popup.addstr(0, 2, title)
+        popup.addnstr(0, 2, title, pw - 4)
         popup.addstr(ph-2, 2, "Press Enter on empty line to finish.")
         curses.echo()
         curses.curs_set(1)
@@ -574,14 +628,21 @@ class AICreatorTUI:
         if not ML_AVAILABLE:
             self._show_message("ML libraries not installed.", error=True)
             return
+        if not PEFT_AVAILABLE:
+            self._show_message("Fine-tuning requires the peft package.", error=True)
+            return
         self._show_message("Fine‑tuning mode – paste your examples next.")
         text = self._multiline_popup("Paste equals‑format examples (end with empty line)")
         if not text:
             self._show_message("No input received.", error=True)
             return
-        self._show_message(f"Got {len(parse_equals_input(text))} examples.")
+        parsed_examples = parse_equals_input(text)
+        if not parsed_examples:
+            self._show_message("No valid equals-format examples found.", error=True)
+            return
+        self._show_message(f"Got {len(parsed_examples)} examples.")
         base_choice = self._input_popup("Base model: 1-Auto, 2-LLM, 3-SLM (default 1): ", "1")
-        if base_choice == "1": base_model = self._auto_select_fine_tune_model()
+        if base_choice == "1": base_model = self._auto_select_fine_tune_model(parsed_examples)
         elif base_choice == "2": base_model = "distilgpt2"
         else: base_model = "sshleifer/tiny-gpt2"
         use_gguf = self._input_popup("Use a local .gguf file as base? (y/n): ", "n").lower() == "y"
@@ -613,13 +674,13 @@ class AICreatorTUI:
         except Exception as e:
             self._show_message(f"Fine‑tuning failed: {e}", error=True)
 
-    def _auto_select_fine_tune_model(self):
+    def _auto_select_fine_tune_model(self, training_rows):
         if AUTOLEARN_AVAILABLE:
             try:
                 learner = AutoLearn()
-                pick = learner.choose_model([])
+                pick = learner.choose_model(training_rows)
                 if pick == "LLM": return "distilgpt2"
-                elif pick == "SLM": return "sshleifer/tiny-gpt2"
+                elif pick in ("SLM", "MLM"): return "sshleifer/tiny-gpt2"
             except Exception:
                 pass
         return "distilgpt2"
@@ -648,28 +709,23 @@ class AICreatorTUI:
             self._show_message(f"Export failed: {e}", error=True)
 
     def _convert_to_gguf(self, model_dir, output_path, quant_type):
-        converter = self._find_llama_cpp_file("convert_hf_to_gguf.py")
-        if not converter:
-            raise RuntimeError("llama.cpp not found. Set LLAMA_CPP_DIR.")
         GGUF_DIR.mkdir(exist_ok=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         f16 = GGUF_DIR / "tmp_f16.gguf"
-        subprocess.run(["python", str(converter), str(model_dir), "--outfile", str(f16)], check=True)
+        converter = _find_llama_cpp_file("convert_hf_to_gguf.py")
+        if not converter:
+            raise RuntimeError("llama.cpp converter not found. Set LLAMA_CPP_DIR.")
+        subprocess.run([sys.executable, str(converter), str(model_dir), "--outfile", str(f16)], check=True)
         if quant_type == "f16":
             shutil.copyfile(f16, output_path)
             return
-        quantizer = self._find_llama_cpp_file("llama-quantize") or self._find_llama_cpp_file("quantize")
+        quantizer = _find_llama_cpp_file("llama-quantize") or _find_llama_cpp_file("quantize")
         if not quantizer:
             raise RuntimeError("llama-quantize not found.")
         subprocess.run([str(quantizer), str(f16), str(output_path), quant_type], check=True)
 
     def _find_llama_cpp_file(self, name):
-        search_dirs = [APP_DIR / "llama.cpp", Path(os.environ.get("LLAMA_CPP_DIR", ""))]
-        for root in search_dirs:
-            if root and root.exists():
-                hits = list(root.rglob(name))
-                if hits:
-                    return hits[0]
-        return None
+        return _find_llama_cpp_file(name)
 
 # ---------- Prediction ----------
     def _test_prediction(self):
