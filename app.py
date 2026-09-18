@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main_cli.py – AI Creator Curses Terminal Application.
+app.py – AI Creator Curses Terminal Application.
 Fully interactive TUI for training, fine‑tuning, and GGUF export.
 Uses autolearn if available.
 """
