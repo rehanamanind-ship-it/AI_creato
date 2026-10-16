@@ -136,6 +136,9 @@ creato.ai/
 │       └── autolearn.py
 ├── tests/
 |    app_test.py
+|-- dist/
+|    creato_ai-0.1.0-py3-none-any.whl
+|    creato_ai-0.1.0.tar.gz
 ├── requirements.txt
 ├── README.md
 └── LICENSE
