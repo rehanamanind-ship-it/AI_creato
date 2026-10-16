@@ -1,162 +1,175 @@
-# AI Creator
+# AI_creato
 
-A single‑file, no‑code terminal application that creates brand‑new language models from `input = output` text files **and** fine‑tunes existing models using structured role‑based examples. Export your models as quantized `.gguf` files ready for llama.cpp, Ollama, or GPT4All – all without writing any code or JSONL.
+<sub>Terminal-first AI builder for training, fine-tuning, export, quantization, and testing.</sub>
 
-## ✨ Features
+Creato AI or AI_creato is a lightweight Python framework for running AI workflows directly from the terminal. It is designed for developers who want to train models, fine-tune language models, export to GGUF, quantize models, and test outputs without a graphical UI.
 
-- **Train from scratch** – provide a simple `input = output` text file and a base model type (Auto Learn, LLM, MLM, SLM).
-- **Fine‑tune with roles** – paste SYSTEM/USER/ASSISTANT examples (separated by `===`) to adapt a model’s behavior.
-- **Upload .gguf as base** – fine‑tune directly on a local GGUF file (requires the corresponding HuggingFace architecture ID).
-- **Smart model selection** – optionally uses `autolearn` to pick the best base model size.
-- **Quantized GGUF export** – choose from 4‑bit, 8‑bit, f16, or other quantization levels.
-- **Interactive testing** – test your trained models with custom prompts right in the terminal.
-- **No external LLM** – all training data comes from your input, no API keys needed.
+## Features
 
-## 📦 Installation
+- Train small dataset models from simple `input = output` files
+- Fine-tune Hugging Face models from conversation-style examples
+- Export trained models to GGUF format
+- Quantize models for smaller and faster deployment
+- Test saved models with direct terminal prompts
+- Keep the whole workflow scriptable and automation-friendly
 
-1. **Clone the repository** (or download `app.py`):
-   
-    Install Python dependencies:
-    bash
+## Why use it?
 
-    pip install torch transformers datasets peft accelerate bitsandbytes trl gguf
+Creato AI is aimed at:
 
-    (Optional) For better auto‑model selection:
-    bash
+- local AI experimentation from the shell
+- easy dataset-driven model training
+- quick testing of model behavior without a notebook UI
+- simple deployment pipelines for terminal-based tools and scripts
 
-    pip install autolearn
+## Installation
 
-    (Optional) For higher‑quality 4‑bit quantization (Linux only):
-    bash
+### Install from a wheel file
 
-    pip install autoawq
+This is the recommended way if you already have the built wheel locally.
 
-    Set up llama.cpp (required for GGUF export):
+```bash
+python -m pip install dist/creato_ai-0.1.0-py3-none-any.whl
+```
 
-        Clone and build llama.cpp.
+After installation, the package dependencies are installed automatically by pip, and the CLI command becomes available:
 
-        Set the environment variable pointing to its directory:
-        bash
+```bash
+creato-ai --help
+creato-ai info
+```
 
-        export LLAMA_CPP_DIR=/path/to/llama.cpp
+### Optional GPU support
 
-🚀 Usage
+```bash
+python -m pip install -e .[gpu]
+```
 
-Run the application:
-bash
+## Quick start
 
-python main_cli.py
+### 1) Show CLI help
 
-You will see an interactive menu:
-text
+```bash
+creato-ai --help
+```
 
-========================================
-AI CREATOR – Terminal Edition
-========================================
-1. Train new model (input = output text file)
-2. Fine‑tune with roles (equals‑format)
-3. Export trained model to GGUF
-4. Test prediction
-5. Quit
+### 2) Check environment status
 
-1. Train a new model
+```bash
+creato-ai info
+```
 
-    Choose option 1.
+### 3) Train a model
 
-    Enter the path to a training file where each line is input = output.
-    Example training.txt:
-    text
+```bash
+creato-ai train examples/training.txt --preset auto --route auto --output-dir ./trained_model
+```
 
-    Hello = Hi there!
-    How are you? = I'm fine, thank you.
-    What is Python? = Python is a programming language.
+### 4) Fine-tune a base model
 
-    Pick a base model type (e.g., 2 for LLM, 4 for SLM, or 1 for Auto Learn).
+```bash
+creato-ai fine-tune examples/fine_tune.txt --base-model distilgpt2 --output-dir ./fine_tuned_model
+```
 
-    Training will start and the model will be saved in the trained_model/ folder.
+### 5) Export to GGUF
 
-2. Fine‑tune with roles
+```bash
+creato-ai export ./trained_model --output ./model.gguf --quant-type q8_0
+```
 
-    Choose option 2.
+### 6) Quantize a model
 
-    Paste your role‑based examples or provide a file path. Use the format:
-    text
+```bash
+creato-ai quantize ./trained_model --output-dir ./quantized_model --method bnb
+```
 
-    =SYSTEM=
-    You are a cheerful coding tutor.
-    =USER=
-    How do I reverse a string in Python?
-    =ASSISTANT=
-    Use slicing: my_string[::-1]
-    ===
-    =USER=
-    What about JavaScript?
-    =ASSISTANT=
-    str.split('').reverse().join('');
-    ===
+### 7) Test a model from the terminal
 
-    Type END on a new line to finish pasting.
+```bash
+creato-ai test ./trained_model --prompt "hello there"
+```
 
-    Choose a base model (or let Auto Learn decide).
+## Data formats
 
-    Optionally, upload a .gguf file as the base – you’ll be asked for its HuggingFace architecture ID.
+### Training file format
 
-    Decide whether to quantize or directly export as GGUF after training.
+```text
+hello = hi there
+how are you = I am doing well
+what is your name = I am a helpful assistant
+```
 
-    The fine‑tuned model is saved in fine_tuned_model/.
+### Fine-tuning format
 
-3. Export to GGUF
+```text
+=SYSTEM= You are a helpful assistant
+=USER= What is the capital of France?
+=ASSISTANT= The capital of France is Paris.
+===
+=USER= What is 2 + 2?
+=ASSISTANT= 4
+```
 
-    Choose option 3 after training or fine‑tuning.
+## Example workflow
 
-    Select a quantization level (e.g., 3 for f16, 1 for 4‑bit).
+```bash
+creato-ai train examples/training.txt --output-dir ./models/my_model
+creato-ai test ./models/my_model --prompt "How do I get started with Python?"
+creato-ai export ./models/my_model --output ./models/my_model.gguf --quant-type q8_0
+```
 
-    Provide an output file name (e.g., my_model.gguf).
+## Project structure
 
-    The app uses llama.cpp tools to produce the GGUF file.
+```text
+creato.ai/
+├── app.py
+├── src/
+│   └── creato_ai/
+│       ├── __init__.py
+│       ├── cli.py
+│       ├── config.py
+│       ├── data.py
+│       ├── training.py
+│       ├── finetune.py
+│       ├── export.py
+│       ├── ml.py
+│       └── autolearn.py
+├── tests/
+|    app_test.py
+├── requirements.txt
+├── README.md
+└── LICENSE
+```
 
-4. Test prediction
+## Packaging and wheel usage
 
-    Choose option 4 to test the latest standard‑trained model.
+Build the wheel locally:
 
-    Enter any prompt; type exit to return to the menu.
+```bash
+python -m build
+```
 
-📁 File Structure
-text
+Install the generated wheel:
 
-ai-creato/
-├── app.py         # The complete application (training + fine‑tuning + export)
-├── requirements.txt # (optional) list of dependencies
-|---- autolearn.py
-└── README.md
+```bash
+python -m pip install dist/creato_ai-0.1.0-py3-none-any.whl
+```
 
-(No separate fine_tuner.py is needed – everything is integrated in app.py.)
-🧠 How It Works
+Then run the app normally:
 
-    Standard training uses HuggingFace Trainer to fine‑tune a small base model (like DistilGPT2) on your input‑output pairs.
+```bash
+creato-ai --help
+creato-ai info
+```
 
-    Fine‑tuning with roles uses QLoRA (4‑bit quantization + LoRA) to efficiently adapt any causal language model to follow the SYSTEM/USER/ASSISTANT format you provide.
+This is the intended workflow for end users: install the wheel, let pip install the dependencies, and use the CLI like a normal application.
 
-    GGUF conversion calls convert_hf_to_gguf.py from llama.cpp and then applies quantization with llama-quantize.
+## Notes
 
-⚠️ Requirements & Notes
+- This project is intended for terminal-first AI workflows rather than graphical UIs.
+- For large model workloads, ensure the required ML libraries are installed in the target environment.
+- Dependency installation is handled automatically through the package metadata when installing from PyPI.
 
-    GPU recommended for faster training; CPU works but is slow.
+## License
 
-    llama.cpp must be installed and compiled to use GGUF export. The app searches for it via the LLAMA_CPP_DIR environment variable or a local llama.cpp folder.
-
-    Tkinter is not required – this is a pure terminal application.
-
-    The autolearn package is optional; if missing, the app uses a simple size heuristic.
-
-    For fine‑tuning with a GGUF base, the gguf Python package is required (pip install gguf).
-
-👤 Author & Contributions
-
-Rehan Aman – creator and maintainer of AI Creator.
-
-Contributions, issues, and feature requests are welcome!
-Feel free to open an issue or submit a pull request on the project repository.
-📄 License
-
-This project is open‑source under the MIT License.
+This project is available under the MIT license.
